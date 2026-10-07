@@ -2256,11 +2256,42 @@ struct dxmt_win_data
 
 static __thread struct dxmt_win_data dxmt_win_data;
 
+/* Windows of other processes have no view here.  DXMT is then handed a tagged HWND
+ * in place of the view, and the "metal view" it creates from it is a remote layer
+ * swapchain (CAContext + CALayerHost), as used for cross-process Vulkan surfaces. */
+#define DXMT_REMOTE_TAG 1
+
+static inline BOOL dxmt_is_remote(const void *ptr)
+{
+    return ((UINT_PTR)ptr & DXMT_REMOTE_TAG) != 0;
+}
+
+static inline void *dxmt_tag(void *ptr)
+{
+    return (void *)((UINT_PTR)ptr | DXMT_REMOTE_TAG);
+}
+
+static inline void *dxmt_untag(const void *ptr)
+{
+    return (void *)((UINT_PTR)ptr & ~(UINT_PTR)DXMT_REMOTE_TAG);
+}
+
 static struct dxmt_win_data *dxmt_get_win_data(HWND hwnd)
 {
     struct macdrv_win_data *data;
 
-    if (!(data = get_win_data(hwnd))) return NULL;
+    if (!(data = get_win_data(hwnd)))
+    {
+        if (!hwnd) return NULL;
+
+        TRACE("win %p belongs to another process, using a remote layer\n", hwnd);
+        memset(&dxmt_win_data, 0, sizeof(dxmt_win_data));
+        dxmt_win_data.hwnd = hwnd;
+        /* HWND values are handles, never odd pointers; shift so the tag bit is free */
+        dxmt_win_data.cocoa_view = dxmt_tag((void *)((UINT_PTR)hwnd << 1));
+        dxmt_win_data.client_cocoa_view = dxmt_win_data.cocoa_view;
+        return &dxmt_win_data;
+    }
 
     if (data->cocoa_window && !data->dxmt_view)
     {
@@ -2280,7 +2311,47 @@ static struct dxmt_win_data *dxmt_get_win_data(HWND hwnd)
 
 static void dxmt_release_win_data(struct dxmt_win_data *dxmt_data)
 {
-    if (dxmt_data) release_win_data(dxmt_data->data);
+    if (dxmt_data && dxmt_data->data) release_win_data(dxmt_data->data);
+}
+
+static WineMetalView *dxmt_view_create_metal_view(WineContentView *view, id_MTLDevice device)
+{
+    id_WineMetalSwapChain swapchain;
+    HWND hwnd, root;
+    RECT rect;
+
+    if (!dxmt_is_remote(view)) return macdrv_view_create_metal_view(view, device);
+
+    hwnd = (HWND)((UINT_PTR)dxmt_untag(view) >> 1);
+    if (!NtUserGetClientRect(hwnd, &rect, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI))) return NULL;
+
+    /* Only top-level windows have a Cocoa window to host the layer.  For a child window
+     * (Chromium's GPU process draws into a child of the browser window), host it on the
+     * top-level window; the layer is placed at the top-left of its client area. */
+    if ((root = NtUserGetAncestor(hwnd, GA_ROOT)) && root != hwnd)
+    {
+        POINT pt = { 0, 0 };
+        NtUserMapWindowPoints(hwnd, root, &pt, 1, NtUserGetWinMonitorDpi(hwnd, MDT_RAW_DPI));
+        if (pt.x || pt.y)
+            FIXME("child window %p is at %s in %p, its layer will be misplaced\n", hwnd, wine_dbgstr_point(&pt), root);
+    }
+    else root = hwnd;
+
+    if (!(swapchain = macdrv_create_offscreen_swapchain(root, cgrect_from_rect(rect)))) return NULL;
+    TRACE("win %p (host %p) remote swapchain %p %s\n", hwnd, root, swapchain, wine_dbgstr_rect(&rect));
+    return dxmt_tag(swapchain);
+}
+
+static CAMetalLayer *dxmt_view_get_metal_layer(WineMetalView *view)
+{
+    if (!dxmt_is_remote(view)) return macdrv_view_get_metal_layer(view);
+    return macdrv_swapchain_get_layer(dxmt_untag(view));
+}
+
+static void dxmt_view_release_metal_view(WineMetalView *view)
+{
+    if (!dxmt_is_remote(view)) macdrv_view_release_metal_view(view);
+    else macdrv_destroy_swapchain(dxmt_untag(view));
 }
 
 struct dxmt_macdrv_functions
@@ -2305,8 +2376,8 @@ __attribute__((visibility("default"))) const struct dxmt_macdrv_functions macdrv
     macdrv_get_cocoa_window,
     macdrv_create_metal_device,
     macdrv_release_metal_device,
-    macdrv_view_create_metal_view,
-    macdrv_view_get_metal_layer,
-    macdrv_view_release_metal_view,
+    dxmt_view_create_metal_view,
+    dxmt_view_get_metal_layer,
+    dxmt_view_release_metal_view,
     NULL,
 };
