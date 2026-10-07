@@ -504,6 +504,19 @@ done:
 
 
 /**********************************************************************
+ *              dxmt_update_view
+ *
+ * Keep the DXMT view covering the window's client area.
+ */
+static void dxmt_update_view(struct macdrv_win_data *data)
+{
+    RECT rect = data->rects.client;
+    OffsetRect(&rect, -data->rects.visible.left, -data->rects.visible.top);
+    macdrv_set_view_frame(data->dxmt_view, cgrect_from_rect(rect));
+}
+
+
+/**********************************************************************
  *              destroy_cocoa_window
  *
  * Destroy the whole Mac window for a given window.
@@ -511,6 +524,12 @@ done:
 static void destroy_cocoa_window(struct macdrv_win_data *data)
 {
     if (!data->cocoa_window) return;
+
+    if (data->dxmt_view)
+    {
+        macdrv_dispose_view(data->dxmt_view);
+        data->dxmt_view = NULL;
+    }
 
     TRACE("win %p Cocoa win %p\n", data->hwnd, data->cocoa_window);
 
@@ -1657,6 +1676,8 @@ void macdrv_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT
 
     if (!data->cocoa_window) goto done;
 
+    if (data->dxmt_view) dxmt_update_view(data);
+
     if (data->on_screen)
     {
         if ((swp_flags & SWP_HIDEWINDOW) && !(new_style & WS_VISIBLE))
@@ -2215,3 +2236,77 @@ void init_win_context(void)
     pthread_mutex_init(&win_data_mutex, &attr);
     pthread_mutexattr_destroy(&attr);
 }
+
+
+/***********************************************************************
+ *              DXMT support
+ *
+ * DXMT (https://github.com/3Shain/dxmt) finds these functions with
+ * dlsym(RTLD_DEFAULT, "macdrv_functions") and reads the window data in the
+ * older layout below, attaching its Metal layer to client_cocoa_view.
+ */
+struct dxmt_win_data
+{
+    HWND                hwnd;
+    WineWindow         *cocoa_window;
+    WineContentView    *cocoa_view;
+    WineContentView    *client_cocoa_view;
+    struct macdrv_win_data *data;
+};
+
+static __thread struct dxmt_win_data dxmt_win_data;
+
+static struct dxmt_win_data *dxmt_get_win_data(HWND hwnd)
+{
+    struct macdrv_win_data *data;
+
+    if (!(data = get_win_data(hwnd))) return NULL;
+
+    if (data->cocoa_window && !data->dxmt_view)
+    {
+        data->dxmt_view = macdrv_create_view(CGRectZero);
+        dxmt_update_view(data);
+        macdrv_set_view_superview(data->dxmt_view, NULL, data->cocoa_window, NULL, NULL);
+        macdrv_set_view_hidden(data->dxmt_view, FALSE);
+    }
+
+    dxmt_win_data.hwnd = data->hwnd;
+    dxmt_win_data.cocoa_window = data->cocoa_window;
+    dxmt_win_data.cocoa_view = data->dxmt_view;
+    dxmt_win_data.client_cocoa_view = data->dxmt_view;
+    dxmt_win_data.data = data;
+    return &dxmt_win_data;
+}
+
+static void dxmt_release_win_data(struct dxmt_win_data *dxmt_data)
+{
+    if (dxmt_data) release_win_data(dxmt_data->data);
+}
+
+struct dxmt_macdrv_functions
+{
+    void *init_display_devices;
+    struct dxmt_win_data *(*get_win_data)(HWND hwnd);
+    void (*release_win_data)(struct dxmt_win_data *data);
+    WineWindow *(*get_cocoa_window)(HWND hwnd, BOOL require_on_screen);
+    id_MTLDevice (*create_metal_device)(void);
+    void (*release_metal_device)(id_MTLDevice device);
+    WineMetalView *(*view_create_metal_view)(WineContentView *view, id_MTLDevice device);
+    CAMetalLayer *(*view_get_metal_layer)(WineMetalView *view);
+    void (*view_release_metal_view)(WineMetalView *view);
+    void *on_main_thread;
+};
+
+__attribute__((visibility("default"))) const struct dxmt_macdrv_functions macdrv_functions =
+{
+    NULL,
+    dxmt_get_win_data,
+    dxmt_release_win_data,
+    macdrv_get_cocoa_window,
+    macdrv_create_metal_device,
+    macdrv_release_metal_device,
+    macdrv_view_create_metal_view,
+    macdrv_view_get_metal_layer,
+    macdrv_view_release_metal_view,
+    NULL,
+};

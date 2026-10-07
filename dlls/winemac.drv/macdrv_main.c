@@ -26,6 +26,7 @@
 
 #include "config.h"
 
+#include <dlfcn.h>
 #include <Security/AuthSession.h>
 #include <IOKit/pwr_mgt/IOPMLib.h>
 
@@ -428,6 +429,11 @@ static NTSTATUS macdrv_init(void *arg)
     struct init_params *params = arg;
     SessionAttributeBits attributes;
     OSStatus status;
+    Dl_info dl_info;
+
+    /* let DXMT find macdrv_functions with dlsym(RTLD_DEFAULT) */
+    if (dladdr(macdrv_init, &dl_info) && dl_info.dli_fname)
+        dlopen(dl_info.dli_fname, RTLD_NOW | RTLD_GLOBAL);
 
     app_icon_callback = params->app_icon_callback;
     app_quit_request_callback = params->app_quit_request_callback;
